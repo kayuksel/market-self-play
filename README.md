@@ -1,6 +1,6 @@
-# Zero-Sum Closed Market Simulation Environment for Multi-Agent Reinforcement Learning with Self-Play
+# Zero-Sum Closed Market Simulation Environment for Multi-Agent Reinforcement Learning (with Self-Play)
 
-This framework provides a simulation environment for market trading based on a closed, zero-sum market model. It enables multi-agent reinforcement learning (MARL) using self-play, where multiple agents compete against each other in a simulated market setting. The system implements a continuous double auction (CDA) model, allowing agents to place buy and sell orders while learning optimal trading strategies in a self-competitive, zero-sum context.
+This repository provides a simulation environment for market trading based on a closed, zero-sum market model. It enables multi-agent reinforcement learning (MARL) using self-play, where multiple agents compete against each other in a simulated market setting. The system implements a continuous double auction (CDA) model, allowing agents to place buy and sell orders while learning optimal trading strategies in a self-competitive, zero-sum context.
 
 The environment is designed for testing and optimizing various reinforcement learning algorithms in a controlled market scenario. Agents can interact with each other by placing limit orders and adapting their strategies based on the market dynamics. This framework is ideal for research and development of intelligent trading strategies, market dynamics modeling, and testing RL-based agent behaviors in a competitive environment.
 
