@@ -13,74 +13,104 @@ from trading_env import TradingEnv, Agent
 from state import shared_state
 import threading
 
-class Actor(nn.Module):
-    def __init__(self, shared_encoder, n_assets, hidden_dim=64):
-        super(Actor, self).__init__()
-        self.shared_encoder = shared_encoder  # Use the shared encoder instance
-        
-        self.fc1 = nn.Linear(hidden_dim, 128)
-        self.out = nn.Linear(128, 2 * n_assets)  # Output size is 2 * n_assets (price_pct and qty_frac for each asset)
+class ResidualMLPBlock(nn.Module):
+    def __init__(self, in_dim, hidden_dim, dropout=0.25):
+        super().__init__()
+        self.norm = nn.LayerNorm(in_dim)
+        self.linear1 = nn.Linear(in_dim, hidden_dim)
+        self.linear2 = nn.Linear(hidden_dim, in_dim)
+        self.dropout = nn.Dropout(dropout)
 
     def forward(self, x):
-        x = self.shared_encoder(x)  # Get the shared encoded representation
-        x = F.relu(self.fc1(x))
-        return self.out(x)  # Output shape: (2 * n_assets,)
+        residual = x
+        x = self.norm(x)
+        x = F.mish(self.linear1(x))
+        x = self.dropout(x)
+        x = self.linear2(x)
+        return F.mish(x + residual)
 
+
+class Actor(nn.Module):
+    def __init__(self, shared_encoder, n_assets, in_dim=64, hidden_dim=128, depth=2, dropout=0.25):
+        super(Actor, self).__init__()
+        self.shared_encoder = shared_encoder
+        self.res_blocks = nn.Sequential(*[
+            ResidualMLPBlock(in_dim, hidden_dim, dropout) for _ in range(depth)
+        ])
+        self.price_head = nn.Linear(in_dim, n_assets)
+        self.qty_head = nn.Linear(in_dim, n_assets)
+
+    def forward(self, x):
+        x = self.shared_encoder(x)  # (batch, in_dim)
+        x = self.res_blocks(x)
+        price_pct = torch.tanh(self.price_head(x))   # ∈ [-1, 1]
+        qty_frac = torch.sigmoid(self.qty_head(x))   # ∈ [0, 1]
+        return torch.cat([price_pct, qty_frac], dim=1)  # (batch, 2*n_assets)
 
 class Critic(nn.Module):
-    def __init__(self, shared_encoder, obs_dim, n_assets, hidden_dim=64):
+    def __init__(self, shared_encoder, obs_dim, n_assets, in_dim=64, hidden_dim=128, depth=2, dropout=0.25):
         super(Critic, self).__init__()
-        self.shared_encoder = shared_encoder  # Use the shared encoder instance
-        
-        # Define the first layer that accepts both state (obs) and action (a)
-        self.fcs = nn.Linear(hidden_dim + (2 * n_assets), 128)  # State + action space size
-        self.fc2 = nn.Linear(128, 128)
-        self.out = nn.Linear(128, 1)  # Output is a single value: the Q-value
+        self.shared_encoder = shared_encoder
+        self.res_blocks = nn.Sequential(*[
+            ResidualMLPBlock(in_dim + 2 * n_assets, hidden_dim, dropout) for _ in range(depth)
+        ])
+        self.head = nn.Linear(in_dim + 2 * n_assets, 1)
 
     def forward(self, s, a):
-        x = self.shared_encoder(s)
-        x = torch.cat([x, a], dim=1)
-        x = F.relu(self.fcs(x))
-        x = F.relu(self.fc2(x))
-        return self.out(x).squeeze(-1) 
+        s_encoded = self.shared_encoder(s)  # (batch, in_dim)
+        x = torch.cat([s_encoded, a], dim=1)
+        x = self.res_blocks(x)
+        return self.head(x).squeeze(-1)
+ 
 
 class SharedEncoder(nn.Module):
-    def __init__(self, input_dim, hidden_dim, use_lstm=True):
+    def __init__(self, input_dim, hidden_dim, num_layers=2, dropout=0.25, use_lstm=True):
         super(SharedEncoder, self).__init__()
         self.use_lstm = use_lstm
         self.input_dim = input_dim
         self.hidden_dim = hidden_dim
+        self.num_layers = num_layers
 
-        # LSTM or GRU selection based on the use_lstm flag
+        # Apply dropout only if num_layers > 1
+        rnn_dropout = dropout if num_layers > 1 else 0.0
+
         if self.use_lstm:
-            # Set input_size to 605 (features per observation), batch_first is true
-            self.rnn = nn.LSTM(input_dim, hidden_dim, batch_first=True)
+            self.rnn = nn.LSTM(
+                input_size=input_dim,
+                hidden_size=hidden_dim,
+                num_layers=num_layers,
+                batch_first=True,
+                dropout=rnn_dropout
+            )
         else:
-            self.rnn = nn.GRU(input_dim, hidden_dim, batch_first=True)
+            self.rnn = nn.GRU(
+                input_size=input_dim,
+                hidden_size=hidden_dim,
+                num_layers=num_layers,
+                batch_first=True,
+                dropout=rnn_dropout
+            )
         
-        # Fully connected layer after RNN to generate the final state encoding
         self.fc = nn.Linear(hidden_dim, hidden_dim)
 
     def forward(self, x):
-        # Ensure x has the shape (batch_size, seq_len, input_dim)
-        if len(x.shape) == 2:  # If the input is of shape (batch_size, input_dim), we add a seq_len dimension
-            x = x.unsqueeze(0)  # Adding seq_len dimension: (batch_size, 1, input_dim)
+        if len(x.shape) == 2:
+            x = x.unsqueeze(1)  # (batch, 1, input_dim)
 
         self.rnn.flatten_parameters()
 
-        h0 = torch.zeros(1, x.size(0), self.hidden_dim).to(x.device)
-        
-        # Forward pass through the RNN (LSTM or GRU)
+        # Initialize hidden state with shape (num_layers, batch_size, hidden_dim)
+        h0 = torch.zeros(self.num_layers, x.size(0), self.hidden_dim, device=x.device)
+
         if self.use_lstm:
-            c0 = torch.zeros(1, x.size(0), self.hidden_dim).to(x.device)
-            out, _ = self.rnn(x, (h0, c0))  # LSTM returns the output and the hidden state
+            c0 = torch.zeros(self.num_layers, x.size(0), self.hidden_dim, device=x.device)
+            out, _ = self.rnn(x, (h0, c0))
         else:
-            out, _ = self.rnn(x, h0)  # GRU returns the output and the hidden state
-        
-        # Use the last time step's output for the next layers (or you can pool across time steps)
-        out = out[:, -1, :]  # Select the last time step output
-        out = F.relu(self.fc(out))  # Apply fully connected layer
-        return out
+            out, _ = self.rnn(x, h0)
+
+        out = out[:, -1, :]  # Last timestep
+        return F.relu(self.fc(out))
+
 
 # ===== ReplayBuffer =====
 class ReplayBuffer:
@@ -114,7 +144,7 @@ def train_rl(algorithm="TD3"):
     n_agents = len(env.agents)
     n_assets = len(assets)
 
-    shared_encoder = SharedEncoder(env.observation_space.shape[0], hidden_dim=64, use_lstm=True).to(device)
+    shared_encoder = SharedEncoder(env.observation_space.shape[0], hidden_dim=128, use_lstm=True).to(device)
     actor_list = [Actor(shared_encoder, n_assets).to(device) for _ in range(n_agents)]
     critic = Critic(shared_encoder, env.observation_space.shape[0], n_assets).to(device)
     critic_tgt = copy.deepcopy(critic)
