@@ -194,10 +194,11 @@ class Market:
 
 
 class TradingEnv(gym.Env):
-    def __init__(self, assets, fee_rate=0.0, nbins=100, price_window_pct=0.1):
+    def __init__(self, assets, fee_rate=0.0, nbins=100, price_window_pct=0.1, num_agents = 50):
         super().__init__()
         self.assets = assets
         self.market = Market(assets, fee_rate)
+        self.num_agents = num_agents
         self.nbins = nbins
         self.pct = price_window_pct
         self.no_trade_counter = 0  # Track periods without executed trades
@@ -227,7 +228,7 @@ class TradingEnv(gym.Env):
         self.agents = []
         self.obs_history = []
         
-        for i in range(5):
+        for i in range(self.num_agents):
             init_port = {a: 20 for a in self.assets}
             ag = Agent(f"agent{i}", 20.0, init_port, self.market)
             ag.reset()
