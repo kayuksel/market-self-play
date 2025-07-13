@@ -31,7 +31,7 @@ class ResidualMLPBlock(nn.Module):
 
 
 class Actor(nn.Module):
-    def __init__(self, shared_encoder, n_assets, in_dim=64, hidden_dim=128, depth=2, dropout=0.25):
+    def __init__(self, shared_encoder, n_assets, in_dim=128, hidden_dim=128, depth=2, dropout=0.25):
         super(Actor, self).__init__()
         self.shared_encoder = shared_encoder
         self.res_blocks = nn.Sequential(*[
@@ -48,7 +48,7 @@ class Actor(nn.Module):
         return torch.cat([price_pct, qty_frac], dim=1)  # (batch, 2*n_assets)
 
 class Critic(nn.Module):
-    def __init__(self, shared_encoder, obs_dim, n_assets, in_dim=64, hidden_dim=128, depth=2, dropout=0.25):
+    def __init__(self, shared_encoder, obs_dim, n_assets, in_dim=128, hidden_dim=128, depth=2, dropout=0.25):
         super(Critic, self).__init__()
         self.shared_encoder = shared_encoder
         self.res_blocks = nn.Sequential(*[
@@ -144,7 +144,7 @@ def train_rl(algorithm="TD3"):
     n_agents = len(env.agents)
     n_assets = len(assets)
 
-    shared_encoder = SharedEncoder(env.observation_space.shape[0], hidden_dim=128, use_lstm=True).to(device)
+    shared_encoder = SharedEncoder(env.observation_space.shape[0], hidden_dim=128, use_lstm=False).to(device)
     actor_list = [Actor(shared_encoder, n_assets).to(device) for _ in range(n_agents)]
     critic = Critic(shared_encoder, env.observation_space.shape[0], n_assets).to(device)
     critic_tgt = copy.deepcopy(critic)
