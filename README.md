@@ -1,4 +1,4 @@
-# Zero-Sum Closed Market Simulation for Multi-Agent Reinforcement Learning with Self-Play
+# Zero-Sum Closed Market Simulation Environment for Multi-Agent Reinforcement Learning with Self-Play
 
 This repository provides a framework for simulating market environments where multiple agents engage in self-play trading using reinforcement learning (RL). The environment is based on a continuous double auction (CDA) model, allowing agents to place buy and sell orders, interact with a limit order book (LOB), and learn optimal trading strategies through self-play.
 
