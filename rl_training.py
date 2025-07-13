@@ -1,134 +1,3 @@
-
-import random
-import numpy as np
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
-from collections import deque
-import gym
-from gym import spaces
-import copy
-
-from trading_env import TradingEnv, Agent
-from state import shared_state
-import threading
-
-class ResidualMLPBlock(nn.Module):
-    def __init__(self, in_dim, hidden_dim, dropout=0.25):
-        super().__init__()
-        self.norm = nn.LayerNorm(in_dim)
-        self.linear1 = nn.Linear(in_dim, hidden_dim)
-        self.linear2 = nn.Linear(hidden_dim, in_dim)
-        self.dropout = nn.Dropout(dropout)
-
-    def forward(self, x):
-        residual = x
-        x = self.norm(x)
-        x = F.mish(self.linear1(x))
-        x = self.dropout(x)
-        x = self.linear2(x)
-        return F.mish(x + residual)
-
-
-class Actor(nn.Module):
-    def __init__(self, shared_encoder, n_assets, in_dim=128, hidden_dim=128, depth=2, dropout=0.25):
-        super(Actor, self).__init__()
-        self.shared_encoder = shared_encoder
-        self.res_blocks = nn.Sequential(*[
-            ResidualMLPBlock(in_dim, hidden_dim, dropout) for _ in range(depth)
-        ])
-        self.price_head = nn.Linear(in_dim, n_assets)
-        self.qty_head = nn.Linear(in_dim, n_assets)
-
-    def forward(self, x):
-        x = self.shared_encoder(x)  # (batch, in_dim)
-        x = self.res_blocks(x)
-        price_pct = torch.tanh(self.price_head(x))   # ∈ [-1, 1]
-        qty_frac = torch.sigmoid(self.qty_head(x))   # ∈ [0, 1]
-        return torch.cat([price_pct, qty_frac], dim=1)  # (batch, 2*n_assets)
-
-class Critic(nn.Module):
-    def __init__(self, shared_encoder, obs_dim, n_assets, in_dim=128, hidden_dim=128, depth=2, dropout=0.25):
-        super(Critic, self).__init__()
-        self.shared_encoder = shared_encoder
-        self.res_blocks = nn.Sequential(*[
-            ResidualMLPBlock(in_dim + 2 * n_assets, hidden_dim, dropout) for _ in range(depth)
-        ])
-        self.head = nn.Linear(in_dim + 2 * n_assets, 1)
-
-    def forward(self, s, a):
-        s_encoded = self.shared_encoder(s)  # (batch, in_dim)
-        x = torch.cat([s_encoded, a], dim=1)
-        x = self.res_blocks(x)
-        return self.head(x).squeeze(-1)
- 
-
-class SharedEncoder(nn.Module):
-    def __init__(self, input_dim, hidden_dim, num_layers=2, dropout=0.25, use_lstm=True):
-        super(SharedEncoder, self).__init__()
-        self.use_lstm = use_lstm
-        self.input_dim = input_dim
-        self.hidden_dim = hidden_dim
-        self.num_layers = num_layers
-
-        # Apply dropout only if num_layers > 1
-        rnn_dropout = dropout if num_layers > 1 else 0.0
-
-        if self.use_lstm:
-            self.rnn = nn.LSTM(
-                input_size=input_dim,
-                hidden_size=hidden_dim,
-                num_layers=num_layers,
-                batch_first=True,
-                dropout=rnn_dropout
-            )
-        else:
-            self.rnn = nn.GRU(
-                input_size=input_dim,
-                hidden_size=hidden_dim,
-                num_layers=num_layers,
-                batch_first=True,
-                dropout=rnn_dropout
-            )
-        
-        self.fc = nn.Linear(hidden_dim, hidden_dim)
-
-    def forward(self, x):
-        if len(x.shape) == 2:
-            x = x.unsqueeze(1)  # (batch, 1, input_dim)
-
-        self.rnn.flatten_parameters()
-
-        # Initialize hidden state with shape (num_layers, batch_size, hidden_dim)
-        h0 = torch.zeros(self.num_layers, x.size(0), self.hidden_dim, device=x.device)
-
-        if self.use_lstm:
-            c0 = torch.zeros(self.num_layers, x.size(0), self.hidden_dim, device=x.device)
-            out, _ = self.rnn(x, (h0, c0))
-        else:
-            out, _ = self.rnn(x, h0)
-
-        out = out[:, -1, :]  # Last timestep
-        return F.relu(self.fc(out))
-
-
-# ===== ReplayBuffer =====
-class ReplayBuffer:
-    def __init__(self, capacity=20000):
-        self.buf = deque(maxlen=capacity)
-
-    def push(self, s, a, r, s2, d):
-        self.buf.append((s, a, r, s2, d))
-
-    def sample(self, batch_size):
-        batch = random.sample(self.buf, batch_size)
-        S, A, R, S2, D = map(np.array, zip(*batch))
-        return S, A, R, S2, D
-
-    def __len__(self):
-        return len(self.buf)
-
-
 def train_rl(algorithm="TD3"):
     """
     Train the agent with the selected reinforcement learning algorithm (DDPG, TD3, SAC).
@@ -223,13 +92,13 @@ def train_rl(algorithm="TD3"):
                     else:
                         target_q = R_t + gamma * Q2_1
 
-                # Critic update for all algorithms (DDPG, TD3, SAC)
+                # Critic update
                 c_opt.zero_grad()
                 loss_c = F.mse_loss(critic(S_t, A_t), target_q)
                 loss_c.backward()
                 c_opt.step()
 
-                # Actor update for all algorithms
+                # Actor update
                 for i, actor in enumerate(actor_list):
                     a_opt[i].zero_grad()
                     loss_a = -critic(S_t, actor(S_t)).mean()
@@ -239,6 +108,7 @@ def train_rl(algorithm="TD3"):
                     loss_a.backward()
                     a_opt[i].step()
 
+                # Soft update targets
                 for p, pt in zip(critic.parameters(), critic_tgt.parameters()):
                     pt.data.mul_(1 - tau).add_(tau * p.data)
 
@@ -256,13 +126,20 @@ def train_rl(algorithm="TD3"):
             if any(ag.value() / total_value < 0.05 for ag in env.agents):
                 break
 
+            # Collect final wealths
             finals = [ag.value() for ag in env.agents]
 
-            winner_idx = np.argmax(finals)
-            loser_idx = np.argmin(finals)
-
-            if loser_idx != winner_idx:
-                actor_list[loser_idx].load_state_dict(actor_list[winner_idx].state_dict())
+            # ===== Replace bottom 20% with top 20% =====
+            frac = 0.2
+            n_rep = max(1, int(n_agents * frac))
+            sorted_idx = np.argsort(finals)
+            losers = sorted_idx[:n_rep]
+            winners = sorted_idx[-n_rep:]
+            for loser_idx, winner_idx in zip(losers, winners[::-1]):
+                actor_list[loser_idx].load_state_dict(
+                    actor_list[winner_idx].state_dict()
+                )
+            # ============================================
 
             tot0 = sum(env.init_vals)
             tot1 = sum(finals)
