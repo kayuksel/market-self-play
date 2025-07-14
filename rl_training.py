@@ -25,8 +25,8 @@ class ResidualMLPBlock(nn.Module):
         residual = x
         x = self.norm(x)
         x = F.mish(self.linear1(x))
-        x = self.dropout(x)
         x = self.linear2(x)
+        x = self.dropout(x)
         return F.mish(x + residual)
 
 
@@ -171,6 +171,11 @@ def train_rl(algorithm="TD3"):
             batch_obs = torch.tensor(obs_n, dtype=torch.float32, device=device)
             batch_actions = actor_list[0](batch_obs).detach().cpu().numpy()
 
+            batch_actions = torch.stack(
+                [actor(batch_obs[i:i+1]).squeeze(0) for i, actor in enumerate(actor_list)],
+                dim=0
+            ).detach().cpu().numpy()
+
             # Exploration for DDPG/TD3/SAC
             actions = batch_actions + np.array([env.agents[i].noise() for i in range(n_agents)])
 
@@ -227,6 +232,7 @@ def train_rl(algorithm="TD3"):
                 c_opt.zero_grad()
                 loss_c = F.mse_loss(critic(S_t, A_t), target_q)
                 loss_c.backward()
+                torch.nn.utils.clip_grad_norm_(critic.parameters(), max_norm=1.0)
                 c_opt.step()
 
                 if algorithm != "DDPG":
@@ -234,6 +240,7 @@ def train_rl(algorithm="TD3"):
                     c2 = critic_2(S2_t, A2)
                     loss_c2 = F.mse_loss(c2, target_q.detach())
                     loss_c2.backward()
+                    torch.nn.utils.clip_grad_norm_(critic_2.parameters(), max_norm=1.0)
                     c_opt_2.step()
 
                 if step_counter % 2 == 0:
@@ -246,6 +253,7 @@ def train_rl(algorithm="TD3"):
                             # SAC uses an entropy regularization term
                             loss_a -= 0.1 * critic_2(S_t, actor(S_t)).mean()
                         loss_a.backward()
+                        torch.nn.utils.clip_grad_norm_(actor.parameters(), max_norm=0.5)
                         a_opt[i].step()
 
                     # Soft update targets
