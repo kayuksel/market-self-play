@@ -1,9 +1,9 @@
-
 import random
 import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.cuda.amp import autocast, GradScaler
 from collections import deque
 import gym
 from gym import spaces
@@ -113,179 +113,249 @@ class SharedEncoder(nn.Module):
 
 
 # ===== ReplayBuffer =====
+def default_to_tensor(x, device, dtype=torch.float32):
+    if isinstance(x, torch.Tensor):
+        return x.clone().detach().to(device).type(dtype)
+    else:
+        return torch.tensor(x, dtype=dtype, device=device)
+
 class ReplayBuffer:
-    def __init__(self, capacity=20000):
-        self.buf = deque(maxlen=capacity)
+    """
+    A simple uniform (non-prioritized) replay buffer for experience replay.
+    """
+    def __init__(self, capacity=20000, device="cuda"):
+        self.capacity = capacity
+        self.device = device
+
+        # storage pointers
+        self.ptr = 0
+        self.size = 0
+
+        # buffers (lazy init)
+        self.s_buf = None
+        self.a_buf = None
+        self.r_buf = None
+        self.s2_buf = None
+        self.d_buf = None
 
     def push(self, s, a, r, s2, d):
-        self.buf.append((s, a, r, s2, d))
+        # to tensor
+        s = default_to_tensor(s, self.device)
+        a = default_to_tensor(a, self.device)
+        r = default_to_tensor(r, self.device).unsqueeze(0)
+        s2 = default_to_tensor(s2, self.device)
+        d = default_to_tensor(d, self.device).unsqueeze(0)
+
+        # lazy initialization of buffers
+        if self.s_buf is None:
+            obs_shape = s.shape
+            act_shape = a.shape
+            self.s_buf  = torch.zeros((self.capacity, *obs_shape),  device=self.device, dtype=s.dtype)
+            self.a_buf  = torch.zeros((self.capacity, *act_shape), device=self.device, dtype=a.dtype)
+            self.r_buf  = torch.zeros((self.capacity, 1),           device=self.device, dtype=r.dtype)
+            self.s2_buf = torch.zeros((self.capacity, *obs_shape),  device=self.device, dtype=s2.dtype)
+            self.d_buf  = torch.zeros((self.capacity, 1),           device=self.device, dtype=d.dtype)
+
+        # store transition
+        self.s_buf[self.ptr]  = s
+        self.a_buf[self.ptr]  = a
+        self.r_buf[self.ptr]  = r
+        self.s2_buf[self.ptr] = s2
+        self.d_buf[self.ptr]  = d
+
+        # advance pointer and size
+        self.ptr = (self.ptr + 1) % self.capacity
+        self.size = min(self.size + 1, self.capacity)
 
     def sample(self, batch_size):
-        batch = random.sample(self.buf, batch_size)
-        S, A, R, S2, D = map(np.array, zip(*batch))
-        return S, A, R, S2, D
+        # uniformly sample indices
+        idx = torch.randint(0, self.size, (batch_size,), device=self.device)
+
+        # fetch batches
+        S  = self.s_buf[idx]
+        A  = self.a_buf[idx]
+        R  = self.r_buf[idx].squeeze(1)
+        S2 = self.s2_buf[idx]
+        D  = self.d_buf[idx].squeeze(1)
+
+        return S, A, R, S2, D, idx
 
     def __len__(self):
-        return len(self.buf)
+        return self.size
 
-
-def train_rl(algorithm="TD3"):
+def train_rl(algorithm: str = "TD3", num_eps: int = 200):
     """
-    Train the agent with the selected reinforcement learning algorithm (DDPG, TD3, SAC).
-    
-    Parameters:
-    - algorithm (str): The RL algorithm to use ("DDPG", "TD3", or "SAC").
+    Train the agent with the selected RL algorithm using AMP (autocast & GradScaler).
+    Supports DDPG, TD3, SAC with Prioritized Experience Replay and shared encoder.
     """
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    # --- Environment ---
     assets = ["AAPL", "GOOG", "TSLA", "MSFT"]
     env = TradingEnv(assets, fee_rate=-0.001)
-    env.reset()
+    obs_n = env.reset()
 
-    n_agents = len(env.agents)
+    n_agents = len(obs_n)
     n_assets = len(assets)
-
-    shared_encoder = SharedEncoder(env.observation_space.shape[0], hidden_dim=128, use_lstm=False).to(device)
-    actor_list = [Actor(shared_encoder, n_assets).to(device) for _ in range(n_agents)]
-    critic = Critic(shared_encoder, env.observation_space.shape[0], n_assets).to(device)
-    critic_tgt = copy.deepcopy(critic)
-
-    buf = ReplayBuffer()
-    a_opt = [torch.optim.AdamW(actor.parameters(), lr=1e-4) for actor in actor_list]
-    c_opt = torch.optim.AdamW(critic.parameters(), lr=1e-3)
     gamma, tau = 0.99, 0.005
 
-    if algorithm != "DDPG":
-        critic_2 = Critic(shared_encoder, env.observation_space.shape[0], n_assets).to(device)
-        critic_2_tgt = copy.deepcopy(critic_2)
-        c_opt_2 = torch.optim.AdamW(critic_2.parameters(), lr=1e-3)
+    # --- Models ---
+    shared_encoder = SharedEncoder(
+        input_dim=env.observation_space.shape[0],
+        hidden_dim=128,
+        use_lstm=False
+    ).to(device)
 
-    num_eps = 200
-    step_counter = 0 
+    actor_list = [Actor(shared_encoder, n_assets).to(device) for _ in range(n_agents)]
+    critic = Critic(
+        shared_encoder,
+        obs_dim=env.observation_space.shape[0],
+        n_assets=n_assets
+    ).to(device)
+    critic_tgt = copy.deepcopy(critic)
+
+    if algorithm != "DDPG":
+        critic_2 = Critic(
+            shared_encoder,
+            obs_dim=env.observation_space.shape[0],
+            n_assets=n_assets
+        ).to(device)
+        critic_2_tgt = copy.deepcopy(critic_2)
+
+    # --- Optimizers & AMP scaler ---
+    a_opt = [torch.optim.AdamW(actor.parameters(), lr=1e-4) for actor in actor_list]
+    c_opt = torch.optim.AdamW(critic.parameters(), lr=1e-3)
+    if algorithm != "DDPG":
+        c_opt_2 = torch.optim.AdamW(critic_2.parameters(), lr=1e-3)
+    scaler = GradScaler()
+
+    # --- Replay Buffer ---
+    buf = ReplayBuffer(capacity=20000, device=device)
+
+    step_counter = 0
 
     for ep in range(num_eps):
-        obs_n = env.reset()
-        ep_rewards = [0] * n_agents
+        if ep > 0:
+            obs_n = env.reset()
 
         while True:
-            actions = []
-            batch_obs = torch.tensor(obs_n, dtype=torch.float32, device=device)
+            # --- Batched shared-encoder pass (inference) ---
+            obs_array = np.stack(obs_n).astype(np.float32)
+            obs_tensor = torch.from_numpy(obs_array).to(device)
+            with torch.no_grad(), autocast():
+                x_enc = shared_encoder(obs_tensor)
+                actions_list = []
+                for i, actor in enumerate(actor_list):
+                    x_i = x_enc[i:i+1]
+                    x = actor.res_blocks(x_i)
+                    price_pct = torch.tanh(actor.price_head(x))
+                    qty_frac = torch.sigmoid(actor.qty_head(x))
+                    actions_list.append(torch.cat([price_pct, qty_frac], dim=1).squeeze(0))
+                batch_actions = torch.stack(actions_list, dim=0).cpu().numpy()
 
-            batch_actions = torch.stack(
-                [actor(batch_obs[i:i+1]).squeeze(0) for i, actor in enumerate(actor_list)],
-                dim=0
-            ).detach().cpu().numpy()
-
-            # Exploration for DDPG/TD3/SAC
-            actions = batch_actions + np.array([env.agents[i].noise() for i in range(n_agents)])
-
+            # Exploration noise
+            actions = batch_actions + np.stack([agent.noise() for agent in env.agents])
             next_obs_n, rewards_n, done, _ = env.step(actions)
 
+            # Logging
             with shared_state.lock:
-
                 shared_state.market = env.market
                 shared_state.agents = env.agents
-
-                total_val = sum(agent.value() for agent in shared_state.agents)
-
-                # Track wealth share for each agent separately at each step
-                for agent in shared_state.agents:
-                    shared_state.step_wealth_history.append((
-                        ep,
-                        step_counter,  # Continuous step count
-                        agent.name,  # Agent name
-                        agent.value() / total_val  # Wealth share for the agent
-                    ))
-
+                total_val = sum(a.value() for a in env.agents)
+                for agent in env.agents:
+                    shared_state.step_wealth_history.append((ep, step_counter, agent.name, agent.value() / total_val))
                 step_counter += 1
 
-            if any(done):
-                print(f"Episode {ep} finished due to no trades for 20 consecutive periods.")
-                break  # Exit the loop if any agent is done (i.e., episode is over)
-
-            for i, (ob, ac, rw, nob) in enumerate(zip(obs_n, actions, rewards_n, next_obs_n)):
-                buf.push(ob, ac, rw, nob, done[i])
-
+            # Store transition
+            for ob, ac, rw, nob, d in zip(obs_n, actions, rewards_n, next_obs_n, done):
+                buf.push(ob, ac, rw, nob, d)
             obs_n = next_obs_n
 
+            # --- Learning step with AMP ---
             if len(buf) >= 256:
-                S, A, R, S2, D = buf.sample(256)
-                S_t = torch.tensor(S, dtype=torch.float32, device=device)
-                A_t = torch.tensor(A, dtype=torch.float32, device=device)
-                R_t = torch.tensor(R, dtype=torch.float32, device=device)
-                S2_t = torch.tensor(S2, dtype=torch.float32, device=device)
+                S, A, R, S2, D, weights = buf.sample(256)
 
-                with torch.no_grad():
-                    current_agent_idx = ep % len(actor_list)
-                    #current_agent_idx = np.argmax([ag.value() for ag in env.agents])
-                    A2 = actor_list[current_agent_idx](S2_t)
-
-                    Q2_1 = critic_tgt(S2_t, A2)
-
+                # Compute target Q-values
+                with torch.no_grad(), autocast():
+                    agent_idx = ep % n_agents
+                    A2 = actor_list[agent_idx](S2)
+                    Q2_1 = critic_tgt(S2, A2)
                     if algorithm != "DDPG":
-                        Q2_2 = critic_2_tgt(S2_t, A2)
-                        mult = torch.min(Q2_1, Q2_2) if algorithm == "TD3" else Q2_1 - Q2_2
-                        target_q = R_t + gamma * mult
+                        Q2_2 = critic_2_tgt(S2, A2)
+                        if algorithm == "TD3":
+                            target_q = R + gamma * torch.min(Q2_1, Q2_2)
+                        else:  # SAC
+                            target_q = R + gamma * (Q2_1 - Q2_2)
                     else:
-                        target_q = R_t + gamma * Q2_1
+                        target_q = R + gamma * Q2_1
 
-                # Critic update
+                # Critic 1 update
                 c_opt.zero_grad()
-                loss_c = F.mse_loss(critic(S_t, A_t), target_q)
-                loss_c.backward()
-                torch.nn.utils.clip_grad_norm_(critic.parameters(), max_norm=1.0)
-                c_opt.step()
+                with autocast():
+                    td_errors = critic(S, A) - target_q
+                    loss_c1 = (weights * td_errors.pow(2)).mean()
+                scaler.scale(loss_c1).backward()
+                scaler.unscale_(c_opt)
+                torch.nn.utils.clip_grad_norm_(critic.parameters(), 1.0)
+                scaler.step(c_opt)
 
+                # Critic 2 update
                 if algorithm != "DDPG":
                     c_opt_2.zero_grad()
-                    c2 = critic_2(S2_t, A2)
-                    loss_c2 = F.mse_loss(c2, target_q.detach())
-                    loss_c2.backward()
-                    torch.nn.utils.clip_grad_norm_(critic_2.parameters(), max_norm=1.0)
-                    c_opt_2.step()
+                    with autocast():
+                        loss_c2 = F.mse_loss(critic_2(S, A), target_q)
+                    scaler.scale(loss_c2).backward()
+                    scaler.unscale_(c_opt_2)
+                    torch.nn.utils.clip_grad_norm_(critic_2.parameters(), 1.0)
+                    scaler.step(c_opt_2)
 
+                # Delayed policy update
                 if step_counter % 2 == 0:
-
-                # Actor update
                     for i, actor in enumerate(actor_list):
                         a_opt[i].zero_grad()
-                        loss_a = -critic(S_t, actor(S_t)).mean()
-                        if algorithm == "SAC":
-                            # SAC uses an entropy regularization term
-                            loss_a -= 0.1 * critic_2(S_t, actor(S_t)).mean()
-                        loss_a.backward()
-                        torch.nn.utils.clip_grad_norm_(actor.parameters(), max_norm=0.5)
-                        a_opt[i].step()
+                        with autocast():
+                            q_val = critic(S, actor(S))
+                            loss_a = -q_val.mean()
+                            if algorithm == "SAC":
+                                q_val2 = critic_2(S, actor(S))
+                                loss_a -= 0.1 * q_val2.mean()
+                        scaler.scale(loss_a).backward()
+                        scaler.unscale_(a_opt[i])
+                        torch.nn.utils.clip_grad_norm_(actor.parameters(), 0.5)
+                        scaler.step(a_opt[i])
 
-                    # Soft update targets
+                    # Soft target updates
                     for p, pt in zip(critic.parameters(), critic_tgt.parameters()):
-                        pt.data.mul_(1 - tau).add_(tau * p.data)
+                        pt.data.mul_(1 - tau)
+                        pt.data.add_(tau * p.data)
+                    if algorithm != "DDPG":
+                        for p, pt in zip(critic_2.parameters(), critic_2_tgt.parameters()):
+                            pt.data.mul_(1 - tau)
+                            pt.data.add_(tau * p.data)
 
-                    for p, pt in zip(critic_2.parameters(), critic_2_tgt.parameters()):
-                        pt.data.mul_(1 - tau).add_(tau * p.data)
+                scaler.update()
 
-            total_value = sum(ag.value() for ag in env.agents)
-            threshold = 1.0 / (n_agents * 4.0)
+            # Evolutionary weight copying on mixed outcomes
+            finals = [ag.value() for ag in env.agents]
+            n_rep = max(1, int(n_agents * 0.2))
+            losers = np.argsort(finals)[:n_rep]
+            winners = np.argsort(finals)[-n_rep:]
 
-            if any(ag.value() / total_value < threshold for ag in env.agents):
+            for loser, winner in zip(losers, winners[::-1]):
+                for p_l, p_w in zip(actor_list[loser].parameters(), actor_list[winner].parameters()):
+                    p_l.data.copy_(p_w.data)
+
+            if any(done):
+                print(f"Episode {ep} ended.")
                 break
 
-            # Collect final wealths
-            finals = [ag.value() for ag in env.agents]
+        # End of episode logging
+        tot0, tot1 = sum(env.init_vals), sum([ag.value() for ag in env.agents])
+        deltas = [(fv/tot1) - (iv/tot0) for iv, fv in zip(env.init_vals, finals)]
+        shares = [fv/tot1 for fv in finals]
+        print(
+            f"Ep {ep} | Δ-Shares: {[round(d,4) for d in deltas]} | "
+            f"Shares: {[round(s,4) for s in shares]} | Total Wealth: {round(tot1,2)}"
+        )
 
-            # ===== Replace bottom 20% with top 20% =====
-            frac = 0.2
-            n_rep = max(1, int(n_agents * frac))
-            sorted_idx = np.argsort(finals)
-            losers = sorted_idx[:n_rep]
-            winners = sorted_idx[-n_rep:]
-            for loser_idx, winner_idx in zip(losers, winners[::-1]):
-                actor_list[loser_idx].load_state_dict(
-                    actor_list[winner_idx].state_dict()
-                )
-            # ============================================
-
-            tot0 = sum(env.init_vals)
-            tot1 = sum(finals)
-            deltas = [float((fv / tot1) - (iv / tot0)) for iv, fv in zip(env.init_vals, finals)]
-            shares = [float(fv / tot1) for fv in finals]
-            print(f"Ep {ep} | Δ-Shares: {[round(d, 4) for d in deltas]} | Shares: {[round(s, 4) for s in shares]} | Total Wealth: {sum(finals)}")
+    print("Training complete.")
