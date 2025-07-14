@@ -242,7 +242,7 @@ def train_rl(algorithm: str = "TD3", num_eps: int = 200):
             # --- Batched shared-encoder pass (inference) ---
             obs_array = np.stack(obs_n).astype(np.float32)
             obs_tensor = torch.from_numpy(obs_array).to(device)
-            with torch.no_grad(), autocast():
+            with torch.no_grad(), autocast(device):
                 x_enc = shared_encoder(obs_tensor)
                 actions_list = []
                 for i, actor in enumerate(actor_list):
@@ -276,7 +276,7 @@ def train_rl(algorithm: str = "TD3", num_eps: int = 200):
                 S, A, R, S2, D, weights = buf.sample(256)
 
                 # Compute target Q-values
-                with torch.no_grad(), autocast():
+                with torch.no_grad(), autocast(device):
                     agent_idx = ep % n_agents
                     A2 = actor_list[agent_idx](S2)
                     Q2_1 = critic_tgt(S2, A2)
@@ -291,7 +291,7 @@ def train_rl(algorithm: str = "TD3", num_eps: int = 200):
 
                 # Critic 1 update
                 c_opt.zero_grad()
-                with autocast():
+                with autocast(device):
                     td_errors = critic(S, A) - target_q
                     loss_c1 = (weights * td_errors.pow(2)).mean()
                 scaler.scale(loss_c1).backward()
@@ -302,7 +302,7 @@ def train_rl(algorithm: str = "TD3", num_eps: int = 200):
                 # Critic 2 update
                 if algorithm != "DDPG":
                     c_opt_2.zero_grad()
-                    with autocast():
+                    with autocast(device):
                         loss_c2 = F.mse_loss(critic_2(S, A), target_q)
                     scaler.scale(loss_c2).backward()
                     scaler.unscale_(c_opt_2)
@@ -313,7 +313,7 @@ def train_rl(algorithm: str = "TD3", num_eps: int = 200):
                 if step_counter % 2 == 0:
                     for i, actor in enumerate(actor_list):
                         a_opt[i].zero_grad()
-                        with autocast():
+                        with autocast(device):
                             q_val = critic(S, actor(S))
                             loss_a = -q_val.mean()
                             if algorithm == "SAC":
@@ -346,7 +346,7 @@ def train_rl(algorithm: str = "TD3", num_eps: int = 200):
                     p_l.data.copy_(p_w.data)
 
             if any(done):
-                print(f"Episode {ep} ended.")
+                print(f"Episode {ep} ended due to insufficient trades.")
                 break
 
         # End of episode logging
