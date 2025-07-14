@@ -192,7 +192,7 @@ def train_rl(algorithm: str = "TD3", num_eps: int = 200):
 
     # --- Environment ---
     assets = ["AAPL", "GOOG", "TSLA", "MSFT"]
-    env = TradingEnv(assets, fee_rate=-0.001)
+    env = TradingEnv(assets, fee_rate=0.000)
     obs_n = env.reset()
 
     n_agents = len(obs_n)
