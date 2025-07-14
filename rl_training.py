@@ -229,26 +229,28 @@ def train_rl(algorithm="TD3"):
                 loss_c.backward()
                 c_opt.step()
 
-                # Actor update
-                for i, actor in enumerate(actor_list):
-                    a_opt[i].zero_grad()
-                    loss_a = -critic(S_t, actor(S_t)).mean()
-                    if algorithm == "SAC":
-                        # SAC uses an entropy regularization term
-                        loss_a -= 0.1 * critic_2(S_t, actor(S_t)).mean()
-                    loss_a.backward()
-                    a_opt[i].step()
-
-                # Soft update targets
-                for p, pt in zip(critic.parameters(), critic_tgt.parameters()):
-                    pt.data.mul_(1 - tau).add_(tau * p.data)
-
                 if algorithm != "DDPG":
                     c_opt_2.zero_grad()
                     c2 = critic_2(S2_t, A2)
                     loss_c2 = F.mse_loss(c2, target_q.detach())
                     loss_c2.backward()
                     c_opt_2.step()
+
+                if step_counter % 2 == 0:
+
+                # Actor update
+                    for i, actor in enumerate(actor_list):
+                        a_opt[i].zero_grad()
+                        loss_a = -critic(S_t, actor(S_t)).mean()
+                        if algorithm == "SAC":
+                            # SAC uses an entropy regularization term
+                            loss_a -= 0.1 * critic_2(S_t, actor(S_t)).mean()
+                        loss_a.backward()
+                        a_opt[i].step()
+
+                    # Soft update targets
+                    for p, pt in zip(critic.parameters(), critic_tgt.parameters()):
+                        pt.data.mul_(1 - tau).add_(tau * p.data)
 
                     for p, pt in zip(critic_2.parameters(), critic_2_tgt.parameters()):
                         pt.data.mul_(1 - tau).add_(tau * p.data)
