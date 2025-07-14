@@ -193,145 +193,141 @@ class Market:
         return combined_vols.astype(np.float32)
 
 
+import numpy as np
+import gym
+from gym import spaces
+
 class TradingEnv(gym.Env):
-    def __init__(self, assets, fee_rate=0.0, nbins=100, price_window_pct=0.1, num_agents = 50):
+    def __init__(self, assets, fee_rate=0.0, nbins=100, price_window_pct=0.1, num_agents=50):
         super().__init__()
         self.assets = assets
         self.market = Market(assets, fee_rate)
         self.num_agents = num_agents
         self.nbins = nbins
         self.pct = price_window_pct
-        self.no_trade_counter = 0  # Track periods without executed trades
-        self.history_len = 5  # Sequence length of 5
+        self.no_trade_counter = 0
+        self.history_len = 5
 
-        # Observation: [order-book histograms] for each asset
-        #             + [normalized portfolio allocations (assets + cash)] for each agent
-        obs_dim = (
-            len(assets) * (2 * nbins)  # buy + sell volumes per bin for each asset
-            + len(assets) + 2           # normalized holdings + cash for each agent
-        )
+        # Number of assets
+        n_assets = len(assets)
+
+        obs_dim = len(assets)*(2*nbins) + (len(assets) + 2) + len(assets)
+
+        # Allow unbounded log-returns
         self.observation_space = spaces.Box(
-            low=0, high=1, shape=(obs_dim,), dtype=np.float32
+            low=-np.inf, high=np.inf,
+            shape=(obs_dim,), dtype=np.float32
         )
 
         # Action: [price_pct, qty_frac] for each asset
         self.action_space = spaces.Box(
-            low=np.array([-1.] * len(assets) + [-1.] * len(assets), dtype=np.float32),  # price_pct and qty_frac for each asset
-            high=np.array([1.] * len(assets) + [1.] * len(assets), dtype=np.float32),
+            low=np.array([-1.]*n_assets + [-1.]*n_assets, dtype=np.float32),
+            high=np.array([1.]*n_assets + [1.]*n_assets, dtype=np.float32),
             dtype=np.float32
         )
-
-        self.obs_history = []  # To store history of observations for each agent
+        self.obs_history = []
 
     def reset(self):
         self.market.reset()
+        # Initialize previous prices for log-returns
+        self.prev_prices = self.market.get_prices().copy()
+
+        # Create agents and initial observations
         self.agents = []
-        self.obs_history = []
-        
         for i in range(self.num_agents):
             init_port = {a: 20 for a in self.assets}
             ag = Agent(f"agent{i}", 20.0, init_port, self.market)
             ag.reset()
             ag.action_low, ag.action_high = self.action_space.low, self.action_space.high
             self.agents.append(ag)
-        
         self.market.add_agents(self.agents)
         self.init_vals = [ag.value() for ag in self.agents]
-        self.no_trade_counter = 0  # Reset counter at the start of a new episode
-        
-        # Initialize observation history for each agent as an empty list of sequences
-        self.obs_history = [[self._obs(ag)] for ag in self.agents]  # Start with the first observation
-        
+        self.no_trade_counter = 0
+
+        # Build initial observations (log-returns = 0)
+        zeros = np.zeros(len(self.assets), dtype=np.float32)
+        init_obs = []
+        for ag in self.agents:
+            base = self._obs(ag)
+            init_obs.append(np.concatenate([base, zeros], axis=0))
+
+        # Initialize history with first observation
+        self.obs_history = [[o] for o in init_obs]
         return [self._get_sequence_obs(i) for i in range(len(self.agents))]
 
     def step(self, actions):
-        # 1) Agents place orders for all assets (price_pct and qty_frac for each asset)
+        # 1) Agents place orders
         for ag, act in zip(self.agents, actions):
-            ag.act(act)  # The act method will apply actions for all assets simultaneously
-        
-        # 2) Match all orders and check if any trade occurred
+            ag.act(act)
+
+        # 2) Match orders
         trade_occurred = self.market.match_orders()
+        self.no_trade_counter = 0 if trade_occurred else self.no_trade_counter + 1
 
-        # Check if any trades were executed
-        if trade_occurred:
-            self.no_trade_counter = 0  # Reset counter if trades occurred
-        else:
-            self.no_trade_counter += 1  # Increment counter if no trades
+        # 3) Compute log-returns
+        current_prices = self.market.get_prices()
+        epsilon = 1e-8
+        log_returns = np.log((current_prices + epsilon) / (self.prev_prices + epsilon))
+        self.prev_prices = current_prices.copy()
 
-        # 3) Compute observations and rewards
+        # 4) Compute new obs and rewards
         obs, rewards = [], []
-        for ag in self.agents:
-            new_val = ag.value()
-            reward = new_val - self.init_vals[self.agents.index(ag)]
-            obs.append(self._obs(ag))  # No need to pass asset_idx, as it's based on all assets
-            rewards.append(reward)
+        for idx, ag in enumerate(self.agents):
+            base = self._obs(ag)
+            obs_with_ret = np.concatenate([base, log_returns], axis=0)
+            obs.append(obs_with_ret)
+            rewards.append(ag.value() - self.init_vals[idx])
 
-        # Update the observation history
-        for i, ag in enumerate(self.agents):
-            if len(self.obs_history[i]) >= self.history_len:
-                self.obs_history[i].pop(0)  # Keep only the last 5 observations
-            self.obs_history[i].append(self._obs(ag))
-
-            # If the history is smaller than 5, repeat the most recent observation to fill the history
-            while len(self.obs_history[i]) < self.history_len:
-                self.obs_history[i].insert(0, self._obs(ag))  # Insert the latest observation at the beginning
-
-        # 4) Reshape observations into (batch_size, seq_len, input_size)
+        # Update history
+        for i in range(len(self.agents)):
+            hist = self.obs_history[i]
+            if len(hist) >= self.history_len:
+                hist.pop(0)
+            hist.append(obs[i])
+            # Pad if needed
+            while len(hist) < self.history_len:
+                hist.insert(0, obs[i])
         sequence_obs = [self._get_sequence_obs(i) for i in range(len(self.agents))]
 
-        # Reset the episode if no trades happened for 15 consecutive periods
+        # 5) Check done (reset after 20 no-trade steps)
         done = [False] * len(self.agents)
         if self.no_trade_counter >= 20:
-            done = [True] * len(self.agents)  # Indicate the episode is done
-            self.reset()  # Reset the environment if no trades for 15 periods
+            done = [True] * len(self.agents)
+            self.reset()
 
         return sequence_obs, rewards, done, {}
 
     def _get_sequence_obs(self, agent_idx):
-        # Ensure the history has exactly 5 observations
-        if len(self.obs_history[agent_idx]) < self.history_len:
-            while len(self.obs_history[agent_idx]) < self.history_len:
-                self.obs_history[agent_idx].insert(0, self.obs_history[agent_idx][-1])  # Repeat the last observation
-        
-        # Concatenate the last 5 observations for the agent (Shape: (5, 605))
-        seq_obs = np.array(self.obs_history[agent_idx])  # Shape should be (5, 605)
-
-        # Reshape to (1, seq_len, input_size) where seq_len = 5 and input_size = 605
-        seq_obs = seq_obs.reshape(self.history_len, -1)  # Reshaped to (5, 605)
-        
-        return seq_obs
+        # Ensure history length
+        hist = self.obs_history[agent_idx]
+        if len(hist) < self.history_len:
+            while len(hist) < self.history_len:
+                hist.insert(0, hist[-1])
+        seq = np.stack(hist, axis=0)  # (history_len, obs_dim)
+        return seq
 
     def _obs(self, ag):
-        wealth = ag.value() + 1e-6  # Adding a small value to avoid division by zero
-
+        # 1) Order-book histograms
         all_hists = []
         for idx in range(len(self.assets)):
-            # Get combined histogram (buy - sell volumes) for all agents
-            combined_vols_all = self.market.get_order_book_histogram(
-                idx, nbins=self.nbins, price_window_pct=self.pct, exclude_agent=None
-            )
-
-            # Get combined histogram (buy - sell volumes) excluding the current agent's orders
-            combined_vols_other = self.market.get_order_book_histogram(
-                idx, nbins=self.nbins, price_window_pct=self.pct, exclude_agent=ag
-            )
-
-            # Concatenate both histograms (all agents' perspective + other agents' perspective)
-            all_hists.append(np.concatenate([combined_vols_all, combined_vols_other], axis=0))
-
+            h_all = self.market.get_order_book_histogram(idx, nbins=self.nbins, price_window_pct=self.pct, exclude_agent=None)
+            h_oth = self.market.get_order_book_histogram(idx, nbins=self.nbins, price_window_pct=self.pct, exclude_agent=ag)
+            all_hists.append(np.concatenate([h_all, h_oth], axis=0))
         hist_obs = np.concatenate(all_hists, dtype=np.float32)
 
-        # 2) Normalized portfolio allocations [assets..., cash]
-        holdings_vals = [ag.get_asset_quantity(a) * self.market.prices[a] for a in self.assets]
-        cash_val = ag.money
-        alloc = np.array(holdings_vals + [cash_val], dtype=np.float32) / wealth
+        # 2) Normalized allocations + cash
+        prices = self.market.get_prices()
+        holdings = [ag.get_asset_quantity(a) * prices[i] for i, a in enumerate(self.assets)]
+        cash = ag.money
+        wealth = ag.value() + 1e-6
+        alloc = np.array(holdings + [cash], dtype=np.float32) / wealth
 
         # 3) Wealth share
-        total_wealth = sum(ag.value() for ag in self.agents)
+        total_wealth = sum(x.value() for x in self.agents)
         wealth_share = ag.value() / total_wealth
 
-        # Return a 1D observation of shape (605,)
         return np.concatenate([hist_obs, alloc, np.array([wealth_share], dtype=np.float32)], axis=0)
+
 
 # ===== OUNoise =====
 class OUNoise:
