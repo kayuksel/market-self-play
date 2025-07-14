@@ -169,7 +169,7 @@ def train_rl(algorithm="TD3"):
         while True:
             actions = []
             batch_obs = torch.tensor(obs_n, dtype=torch.float32, device=device)
-            
+
             batch_actions = torch.stack(
                 [actor(batch_obs[i:i+1]).squeeze(0) for i, actor in enumerate(actor_list)],
                 dim=0
@@ -216,6 +216,7 @@ def train_rl(algorithm="TD3"):
 
                 with torch.no_grad():
                     current_agent_idx = ep % len(actor_list)
+                    #current_agent_idx = np.argmax([ag.value() for ag in env.agents])
                     A2 = actor_list[current_agent_idx](S2_t)
 
                     Q2_1 = critic_tgt(S2_t, A2)
