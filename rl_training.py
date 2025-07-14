@@ -169,8 +169,7 @@ def train_rl(algorithm="TD3"):
         while True:
             actions = []
             batch_obs = torch.tensor(obs_n, dtype=torch.float32, device=device)
-            batch_actions = actor_list[0](batch_obs).detach().cpu().numpy()
-
+            
             batch_actions = torch.stack(
                 [actor(batch_obs[i:i+1]).squeeze(0) for i, actor in enumerate(actor_list)],
                 dim=0
